@@ -2,79 +2,66 @@ const express  = require('express');
 const cors     = require('cors');
 const { exec } = require('child_process');
 const fs       = require('fs');
-const path     = require('path');
 const https    = require('https');
-const http     = require('http');
 const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Config (Railway Environment Variables) ──
 const ARCHIVE_ACCESS = process.env.ARCHIVE_ACCESS_KEY;
 const ARCHIVE_SECRET = process.env.ARCHIVE_SECRET_KEY;
 const SUPABASE_URL   = process.env.SUPABASE_URL;
-const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_KEY; // service role key
+const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_KEY;
 const ADMIN_SECRET   = process.env.ADMIN_SECRET || 'animelk2026';
 
-const db = createClient(SUPABASE_URL, SUPABASE_KEY);
+// Lazy Supabase — startup crash නෑ
+function getDb() {
+    if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error('Supabase env vars missing');
+    return createClient(SUPABASE_URL, SUPABASE_KEY);
+}
 
 app.use(cors());
 app.use(express.json());
 
-// ── Auth Middleware ──
+// ── Auth ──
 function authCheck(req, res, next) {
     const secret = req.headers['x-admin-secret'];
-    if (secret !== ADMIN_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (secret !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized' });
     next();
 }
 
-// ── Health Check ──
+// ── Health ──
 app.get('/', (req, res) => {
     res.json({ status: 'AnimeLK Uploader Running ✓', time: new Date() });
 });
 
-// ── Upload Endpoint ──
+// ── Upload ──
 app.post('/upload', authCheck, async (req, res) => {
-    const {
-        m3u8_url,
-        anime_id,
-        anime_name,
-        episode_number,
-        subtitle_url,
-        subtitle_url_en,
-        intro_start
-    } = req.body;
-
+    const { m3u8_url, anime_id, anime_name, episode_number, subtitle_url, subtitle_url_en, intro_start } = req.body;
     if (!m3u8_url || !anime_id || !episode_number) {
         return res.status(400).json({ error: 'Required fields missing' });
     }
-
-    // Immediately respond — processing background
     res.json({ status: 'processing', message: 'Background download started' });
-
-    // Background processing
-    processUpload({
-        m3u8_url, anime_id, anime_name,
-        episode_number, subtitle_url, subtitle_url_en, intro_start
-    }).catch(err => console.error('[Upload Error]', err));
+    processUpload({ m3u8_url, anime_id, anime_name, episode_number, subtitle_url, subtitle_url_en, intro_start })
+        .catch(err => console.error('[Upload Error]', err));
 });
 
-// ── Status Check ──
+// ── Status ──
 app.get('/status/:anime_id/:ep', authCheck, async (req, res) => {
-    const { anime_id, ep } = req.params;
-    const { data } = await db
-        .from('episodes')
-        .select('video_url, created_at')
-        .eq('anime_id', anime_id)
-        .eq('episode_number', parseInt(ep))
-        .single();
-    res.json({ done: !!data?.video_url, data });
+    try {
+        const db = getDb();
+        const { data } = await db.from('episodes')
+            .select('video_url, created_at')
+            .eq('anime_id', req.params.anime_id)
+            .eq('episode_number', parseInt(req.params.ep))
+            .single();
+        res.json({ done: !!data?.video_url, data });
+    } catch(e) {
+        res.json({ done: false, error: e.message });
+    }
 });
 
-// ── Process Upload ──
+// ── Process ──
 async function processUpload({ m3u8_url, anime_id, anime_name, episode_number, subtitle_url, subtitle_url_en, intro_start }) {
     const safeName  = (anime_name || anime_id).replace(/[^a-z0-9]/gi, '-').toLowerCase();
     const filename  = `${safeName}-ep${episode_number}.mp4`;
@@ -84,21 +71,16 @@ async function processUpload({ m3u8_url, anime_id, anime_name, episode_number, s
     console.log(`[Process] Starting: ${filename}`);
 
     try {
-        // Step 1: ffmpeg download
         console.log('[Step 1] ffmpeg download...');
-        await runCommand(
-            `ffmpeg -i "${m3u8_url}" -c copy -bsf:a aac_adtstoasc -y "${tmpPath}"`,
-            300000 // 5 min timeout
-        );
-        console.log('[Step 1] Download complete');
+        await runCommand(`ffmpeg -i "${m3u8_url}" -c copy -bsf:a aac_adtstoasc -y "${tmpPath}"`, 300000);
+        console.log('[Step 1] Done');
 
-        // Step 2: archive.org upload
         console.log('[Step 2] archive.org upload...');
         const videoUrl = await uploadToArchive(tmpPath, filename, identifier, anime_name, episode_number);
-        console.log('[Step 2] Upload complete:', videoUrl);
+        console.log('[Step 2] Done:', videoUrl);
 
-        // Step 3: Supabase save
         console.log('[Step 3] Supabase save...');
+        const db = getDb();
         const epData = {
             anime_id,
             episode_number: parseInt(episode_number),
@@ -108,9 +90,7 @@ async function processUpload({ m3u8_url, anime_id, anime_name, episode_number, s
             intro_start: intro_start || null
         };
 
-        // Check if exists
-        const { data: existing } = await db
-            .from('episodes')
+        const { data: existing } = await db.from('episodes')
             .select('id')
             .eq('anime_id', anime_id)
             .eq('episode_number', parseInt(episode_number))
@@ -126,20 +106,17 @@ async function processUpload({ m3u8_url, anime_id, anime_name, episode_number, s
     } catch (err) {
         console.error('[Process Error]', err.message);
     } finally {
-        // Clean up temp file
         if (fs.existsSync(tmpPath)) {
             fs.unlinkSync(tmpPath);
-            console.log('[Cleanup] Temp file deleted');
+            console.log('[Cleanup] Done');
         }
     }
 }
 
-// ── Upload to Archive.org ──
 function uploadToArchive(filePath, filename, identifier, animeName, epNumber) {
     return new Promise((resolve, reject) => {
-        const fileSize = fs.statSync(filePath).size;
+        const fileSize   = fs.statSync(filePath).size;
         const fileStream = fs.createReadStream(filePath);
-
         const options = {
             hostname: 's3.us.archive.org',
             path: `/${identifier}/${filename}`,
@@ -154,26 +131,22 @@ function uploadToArchive(filePath, filename, identifier, animeName, epNumber) {
                 'x-archive-auto-make-bucket': '1'
             }
         };
-
         const req = https.request(options, (res) => {
             let body = '';
             res.on('data', d => body += d);
             res.on('end', () => {
                 if (res.statusCode === 200 || res.statusCode === 201) {
-                    const url = `https://archive.org/download/${identifier}/${filename}`;
-                    resolve(url);
+                    resolve(`https://archive.org/download/${identifier}/${filename}`);
                 } else {
                     reject(new Error(`Archive upload failed: ${res.statusCode} ${body}`));
                 }
             });
         });
-
         req.on('error', reject);
         fileStream.pipe(req);
     });
 }
 
-// ── Run Shell Command ──
 function runCommand(cmd, timeout = 120000) {
     return new Promise((resolve, reject) => {
         const proc = exec(cmd, { timeout }, (err, stdout, stderr) => {
@@ -185,6 +158,4 @@ function runCommand(cmd, timeout = 120000) {
     });
 }
 
-app.listen(PORT, () => {
-    console.log(`AnimeLK Uploader Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`AnimeLK Uploader running on port ${PORT}`));
